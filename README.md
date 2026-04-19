@@ -80,8 +80,8 @@ Simple Query     RAG Query
 ## ⚙️ Installation
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+git clone https://github.com/chiraggoyal/ChatPDF.git
+cd ChatPDF
 pip install -r requirements.txt
 ```
 
@@ -190,7 +190,7 @@ This project is open-source and available under the MIT License.
 
 ## 💡 Author
 
-**Your Name**
-GitHub: https://github.com/your-username
+**Chirag Goyal**
+GitHub: https://github.com/chiraggoyal-12
 
 ---
