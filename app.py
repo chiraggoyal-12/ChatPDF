@@ -1,23 +1,102 @@
-## RAG Q&A Conversation with PDF including chat history
 
 import os
 import tempfile
+from typing import TypedDict
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain.chains import (create_history_aware_retriever,
-                              create_retrieval_chain)
-from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import StateGraph
 
 load_dotenv()
+
+class GraphState(TypedDict):
+  question: str
+  context: str
+  answer: str
+  route: str
+  chat_history: list
+
+def classify_question(state, llm):
+  question = state["question"]
+  history = state.get("chat_history", [])
+
+  history_text = "\n".join([msg.content for msg in history])
+
+  prompt = f"""
+  You are a classifier.
+
+  Conversation so far:
+  {history_text}
+
+  If the question can be answered WITHOUT documents → simple  
+  If it requires uploaded PDF context → rag  
+
+  Question: {question}
+
+  Answer ONLY one word: simple or rag
+  """
+
+  result = llm.invoke(prompt).content.strip().lower()
+
+  # safety fallback
+  if "rag" in result:
+    return {"route": "rag"}
+  else:
+    return {"route": "simple"}
+
+def retrieve(state, retriever):
+
+  question = state["question"]
+  history = state.get("chat_history", [])
+
+  history_text = " ".join([msg.content for msg in history])
+
+  query = history_text + " " + question
+
+  docs = retriever.get_relevant_documents(query)
+
+  context = "\n".join([doc.page_content for doc in docs])
+  return {"context": context}
+
+def generate_answer(state, llm):
+  
+  question = state["question"]
+  history = state.get("chat_history", [])
+
+  history_text = "\n".join([msg.content for msg in history])
+
+  if state["route"] == "simple":
+    prompt = f"""
+      Conversation:
+      {history_text}
+
+      Question:
+      {question}
+    """
+    response = llm.invoke(prompt).content
+
+  else:
+    prompt = f"""
+    You are a helpful assistant.
+
+    Conversation:
+    {history_text}
+
+    Context:
+    {state.get("context", "")}
+
+    Question:
+    {state["question"]}
+"""
+    response = llm.invoke(prompt).content
+
+  return {"answer": response}
 
 ## Streamlit UI
 st.title("Conversational RAG with PDF uploads and chat history")
@@ -27,124 +106,123 @@ st.write("Upload PDFs and chat with their content")
 api_key = st.text_input("Enter your OpenAI API Key:", type="password")
 
 if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
+  os.environ["OPENAI_API_KEY"] = api_key
 
-    ## LLM
-    llm = ChatOpenAI(model="gpt-4o-mini")
+  ## LLM
+  llm = ChatOpenAI(model="gpt-4o-mini")
 
-    ## Session ID
-    session_id = st.text_input("Session ID", value="default_session")
+  ## Session ID
+  session_id = st.text_input("Session ID", value="default_session")
 
-    ## Chat history store
-    if 'store' not in st.session_state:
-        st.session_state.store = {}
+  ## Chat history store
+  if 'store' not in st.session_state:
+    st.session_state.store = {}
 
-    ## File uploader
-    uploaded_files = st.file_uploader(
-        "Choose PDF files",
-        type="pdf",
-        accept_multiple_files=True
+  ## File uploader
+  uploaded_files = st.file_uploader(
+    "Choose PDF files",
+    type="pdf",
+    accept_multiple_files=True
+  )
+
+  if uploaded_files:
+    documents = []
+
+    ## Use tempfile instead of temp.pdf
+    for uploaded_file in uploaded_files:
+      with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
+
+      loader = PyPDFLoader(tmp_path)
+      docs = loader.load()
+      documents.extend(docs)
+
+    ## Split documents
+    text_splitter = RecursiveCharacterTextSplitter(
+      chunk_size=2000,
+      chunk_overlap=200
+    )
+    splits = text_splitter.split_documents(documents)
+
+    ## OpenAI embeddings
+    embeddings = OpenAIEmbeddings()
+
+    ## Vector store
+    vectorstore = Chroma.from_documents(
+      documents=splits,
+      embedding=embeddings,
+      persist_directory="./chroma_db"
+    )
+    retriever = vectorstore.as_retriever()
+
+    ## Contextual question reformulation
+    contextualize_q_system_prompt = (
+      "Given a chat history and the latest user question, "
+      "reformulate it into a standalone question if needed. "
+      "Do NOT answer it."
     )
 
-    if uploaded_files:
-        documents = []
+    ## QA prompt
+    system_prompt = (
+      "You are an assistant for question-answering tasks. "
+      "Use the retrieved context to answer the question. "
+      "If you don't know, say you don't know. "
+      "Use max 10 sentences.\n\n{context}"
+    )
 
-        ## Use tempfile instead of temp.pdf
-        for uploaded_file in uploaded_files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                tmp_path = tmp_file.name
+    ## Session history function
+    def get_session_history(session: str) -> BaseChatMessageHistory:
+      if session not in st.session_state.store:
+          st.session_state.store[session] = ChatMessageHistory()
+      return st.session_state.store[session]
 
-            loader = PyPDFLoader(tmp_path)
-            docs = loader.load()
-            documents.extend(docs)
+    graph = StateGraph(GraphState)
 
-        ## Split documents
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=2000,
-            chunk_overlap=200
-        )
-        splits = text_splitter.split_documents(documents)
 
-        ## OpenAI embeddings
-        embeddings = OpenAIEmbeddings()
+    graph.add_node("classify", lambda state: classify_question(state, llm))
+    graph.add_node("retrieve", lambda state: retrieve(state, retriever))
+    graph.add_node("generate_answer", lambda state: generate_answer(state, llm))
 
-        ## Vector store
-        vectorstore = Chroma.from_documents(
-            documents=splits,
-            embedding=embeddings
-        )
-        retriever = vectorstore.as_retriever()
+    graph.set_entry_point("classify")
 
-        ## Contextual question reformulation
-        contextualize_q_system_prompt = (
-            "Given a chat history and the latest user question, "
-            "reformulate it into a standalone question if needed. "
-            "Do NOT answer it."
-        )
+    def route_decision(state):
+        return state["route"]
 
-        contextualize_q_prompt = ChatPromptTemplate.from_messages([
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}")
-        ])
+    graph.add_conditional_edges(
+      "classify",
+      route_decision,
+      {
+        "simple": "generate_answer",
+        "rag": "retrieve"
+      }
+    )
 
-        history_aware_retriever = create_history_aware_retriever(
-            llm, retriever, contextualize_q_prompt
-        )
+    graph.add_edge("retrieve", "generate_answer")
 
-        ## QA prompt
-        system_prompt = (
-            "You are an assistant for question-answering tasks. "
-            "Use the retrieved context to answer the question. "
-            "If you don't know, say you don't know. "
-            "Use max 10 sentences.\n\n{context}"
-        )
+    app = graph.compile()
 
-        qa_prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}")
-        ])
+    ## User input
+    user_input = st.text_input("Your question:")
 
-        question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    if user_input:
+      session_history = get_session_history(session_id)
 
-        rag_chain = create_retrieval_chain(
-            history_aware_retriever,
-            question_answer_chain
-        )
+      history_messages = session_history.messages
 
-        ## Session history function
-        def get_session_history(session: str) -> BaseChatMessageHistory:
-            if session not in st.session_state.store:
-                st.session_state.store[session] = ChatMessageHistory()
-            return st.session_state.store[session]
+      response = app.invoke({
+        "question": user_input,
+        "chat_history": history_messages
+      })
 
-        ## Conversational chain
-        conversational_rag_chain = RunnableWithMessageHistory(
-            rag_chain,
-            get_session_history,
-            input_messages_key="input",
-            history_messages_key="chat_history",
-            output_messages_key="answer"
-        )
+      session_history.add_user_message(user_input)
+      session_history.add_ai_message(response["answer"])
 
-        ## User input
-        user_input = st.text_input("Your question:")
+      st.write("### Route Taken:")
+      st.write(response["route"])
 
-        if user_input:
-            session_history = get_session_history(session_id)
-
-            response = conversational_rag_chain.invoke(
-                {"input": user_input},
-                config={"configurable": {"session_id": session_id}}
-            )
-
-            st.write("### Assistant:")
-            st.write(response["answer"])
-
-            st.write("### Chat History:")
-            st.write(session_history.messages)
+      st.write("### Assistant:")
+      st.write(response["answer"])
 
 else:
     st.warning("Please enter the OpenAI API Key")
